@@ -1,0 +1,259 @@
+// work in progress, trying to replicate Odin RTTI model in Zig
+
+const std = @import("std");
+
+pub const Any = struct {
+    ty: *RuntimeType,
+};
+
+fn make_runtime_type(comptime T: type) *const RuntimeType {
+    const Storage = struct {
+        const ty: RuntimeType = make_runtime_type_(T);
+    };
+    return &Storage.ty;
+}
+
+fn make_runtime_type_(comptime T: type) RuntimeType {
+    const ty: std.builtin.Type = @typeInfo(T);
+
+    switch (ty) {
+        .void => {
+            return RuntimeType{ .void = void };
+        },
+        .bool => {
+            return RuntimeType{ .bool = void };
+        },
+        .int => |t| {
+            return RuntimeType{ .int = RuntimeType.Int{
+                .signedness = t.signedness,
+                .bits = t.bits,
+            } };
+        },
+        .float => |t| {
+            return RuntimeType{ .int = RuntimeType.Int{
+                .signedness = t.signedness,
+                .bits = t.bits,
+            } };
+        },
+        .pointer => {},
+        .array => {},
+        .@"struct" => {},
+        .optional => {},
+        .@"enum" => {},
+        .@"union" => {},
+        .@"opaque" => {},
+        .vector => {},
+    }
+}
+
+/// This data structure is used by the Zig language code generation and
+/// therefore must be kept in sync with the compiler implementation.
+pub const RuntimeType = union(enum) {
+    void: void,
+    bool: void,
+    int: Int,
+    float: Float,
+    pointer: Pointer,
+    array: Array,
+    @"struct": Struct,
+    optional: Optional,
+    @"enum": Enum,
+    @"union": Union,
+    @"opaque": Opaque,
+    vector: Vector,
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const Int = struct {
+        signedness: std.builtin.Signedness,
+        bits: u16,
+    };
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const Float = struct {
+        bits: u16,
+    };
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const Pointer = struct {
+        size: Size,
+        is_const: bool,
+        is_volatile: bool,
+        /// TODO make this u16 instead of comptime_int
+        alignment: u16,
+        address_space: std.builtin.AddressSpace,
+        child: *RuntimeType,
+        is_allowzero: bool,
+
+        /// The type of the sentinel is the element type of the pointer, which is
+        /// the value of the `child` field in this struct. However there is no way
+        /// to refer to that type here, so we use `*const anyopaque`.
+        /// See also: `sentinel`
+        sentinel_ptr: ?*const anyopaque,
+
+        /// Loads the pointer type's sentinel value from `sentinel_ptr`.
+        /// Returns `null` if the pointer type has no sentinel.
+        pub inline fn sentinel(comptime ptr: Pointer) ?ptr.child {
+            const sp: *const ptr.child = @ptrCast(@alignCast(ptr.sentinel_ptr orelse return null));
+            return sp.*;
+        }
+
+        /// This data structure is used by the Zig language code generation and
+        /// therefore must be kept in sync with the compiler implementation.
+        pub const Size = enum(u2) {
+            one,
+            many,
+            slice,
+            c,
+        };
+    };
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const Array = struct {
+        len: u16,
+        child: *RuntimeType,
+
+        /// The type of the sentinel is the element type of the array, which is
+        /// the value of the `child` field in this struct. However there is no way
+        /// to refer to that type here, so we use `*const anyopaque`.
+        /// See also: `sentinel`.
+        sentinel_ptr: ?*const anyopaque,
+
+        /// Loads the array type's sentinel value from `sentinel_ptr`.
+        /// Returns `null` if the array type has no sentinel.
+        pub inline fn sentinel(comptime arr: Array) ?arr.child {
+            const sp: *const arr.child = @ptrCast(@alignCast(arr.sentinel_ptr orelse return null));
+            return sp.*;
+        }
+    };
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const ContainerLayout = enum(u2) {
+        auto,
+        @"extern",
+        @"packed",
+    };
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const StructField = struct {
+        name: [:0]const u8,
+        type: *RuntimeType,
+        /// The type of the default value is the type of this struct field, which
+        /// is the value of the `type` field in this struct. However there is no
+        /// way to refer to that type here, so we use `*const anyopaque`.
+        /// See also: `defaultValue`.
+        default_value_ptr: ?*const anyopaque,
+        is_comptime: bool,
+        alignment: u16,
+
+        /// Loads the field's default value from `default_value_ptr`.
+        /// Returns `null` if the field has no default value.
+        pub inline fn defaultValue(comptime sf: StructField) ?sf.type {
+            const dp: *const sf.type = @ptrCast(@alignCast(sf.default_value_ptr orelse return null));
+            return dp.*;
+        }
+    };
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const Struct = struct {
+        layout: ContainerLayout,
+        /// Only valid if layout is .@"packed"
+        backing_integer: ?*RuntimeType = null,
+        fields: []const StructField,
+        decls: []const Declaration,
+        is_tuple: bool,
+    };
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const Optional = struct {
+        child: *RuntimeType,
+    };
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const ErrorUnion = struct {
+        error_set: *RuntimeType,
+        payload: *RuntimeType,
+    };
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const Error = struct {
+        name: [:0]const u8,
+    };
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const ErrorSet = ?[]const Error;
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const EnumField = struct {
+        name: [:0]const u8,
+        value: u64,
+    };
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const Enum = struct {
+        tag_type: *RuntimeType,
+        fields: []const EnumField,
+        decls: []const Declaration,
+        is_exhaustive: bool,
+    };
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const UnionField = struct {
+        name: [:0]const u8,
+        type: *RuntimeType,
+        alignment: u64,
+    };
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const Union = struct {
+        layout: ContainerLayout,
+        tag_type: ?*RuntimeType,
+        fields: []const UnionField,
+        decls: []const Declaration,
+    };
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const Opaque = struct {
+        decls: []const Declaration,
+    };
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const Frame = struct {
+        function: *const anyopaque,
+    };
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const AnyFrame = struct {
+        child: ?*RuntimeType,
+    };
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const Vector = struct {
+        len: u64,
+        child: *RuntimeType,
+    };
+
+    /// This data structure is used by the Zig language code generation and
+    /// therefore must be kept in sync with the compiler implementation.
+    pub const Declaration = struct {
+        name: [:0]const u8,
+    };
+};

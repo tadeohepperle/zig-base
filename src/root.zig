@@ -1,0 +1,420 @@
+const std = @import("std");
+
+var allocator_backing = std.heap.GeneralPurposeAllocator(.{}){};
+pub const allocator: std.mem.Allocator = allocator_backing.allocator();
+
+var temp_allocator_backing = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+pub const temp_allocator = temp_allocator_backing.allocator();
+
+pub fn tmpSlice(comptime T: type, n: usize) []T {
+    return temp_allocator.alloc(T, n) catch @panic("TempAllocatorOutOfMemory");
+}
+// const any = @import("any.zig");
+
+// The two types Array and TmpArray exists for convenience because it is really annoying
+// to handle allocation errors and pass allocators explicitly all the time;
+pub fn Array(T: type) type {
+    return DynamicArray(T, false);
+}
+pub fn TmpArray(T: type) type {
+    return DynamicArray(T, true);
+}
+
+fn DynamicArray(comptime T: type, comptime is_tmp: bool) type {
+    if (@sizeOf(T) == 0) {
+        @compileError("DynamicArray should only be used with types of non-zero size!");
+    }
+
+    return struct {
+        const Slice = []T;
+        const Self = @This();
+        const gpa = if (is_tmp) temp_allocator else allocator;
+
+        items: Slice = &.{},
+        cap: usize = 0,
+
+        pub fn init() Self {
+            return Self{};
+        }
+        pub fn deinit(self: *Self) void {
+            if (comptime is_tmp) return;
+            gpa.free(self.allocatedSlice());
+        }
+
+        pub fn deinitWith(self: *Self, deinit_fn: fn (el: *T) void) void {
+            for (self.items) |*item| {
+                deinit_fn(item);
+            }
+            if (comptime is_tmp) return;
+            gpa.free(self.allocatedSlice());
+        }
+
+        pub fn allocatedSlice(self: Self) Slice {
+            return self.items.ptr[0..self.cap];
+        }
+
+        pub fn shrink(self: *Self) void {
+            if (comptime is_tmp) return;
+            const new_cap = self.items.len;
+            const old_memory = self.allocatedSlice();
+            if (gpa.remap(old_memory, new_cap)) |new_items| {
+                self.cap = new_cap;
+                self.items = new_items;
+            } else {
+                const new_memory = gpa.alloc(T, new_cap) catch @panic("OutOfMemory");
+                @memcpy(new_memory, self.items);
+                gpa.free(old_memory);
+                self.items = new_memory;
+                self.cap = new_memory.len;
+            }
+        }
+
+        pub fn clone(self: Self) Self {
+            var res = Self.init();
+            if (self.items.len > 0) res.pushSlice(self.items);
+            return res;
+        }
+
+        pub fn clear(self: *Self) void {
+            if (self.items.len == 0) return;
+            @memset(self.items, undefined);
+            self.items.len = 0;
+        }
+
+        pub fn pushSlice(self: *Self, items: []const T) void {
+            const new_len = self.items.len + items.len;
+            if (new_len > self.cap) {
+                self.reserve(calculateNewCapacity(self.cap, new_len));
+            }
+            @memcpy(self.items.ptr[self.items.len..new_len], items);
+            self.items.len = new_len;
+        }
+
+        pub fn push(self: *Self, item: T) void {
+            const new_len = self.items.len + 1;
+            if (new_len > self.cap) {
+                self.reserve(calculateNewCapacity(self.cap, new_len));
+            }
+            self.items.ptr[self.items.len] = item;
+            self.items.len = new_len;
+        }
+
+        pub fn makeZeroTerminated(self: *Self) void {
+            if (comptime T == u8) {
+                self.push(0);
+                self.items.len -= 1;
+            } else {
+                @compileError("Can only make DynamicArray(u8) zero-terminated!");
+            }
+        }
+
+        pub fn reserve(self: *Self, new_cap: usize) void {
+            if (new_cap <= self.cap) return;
+
+            // Here we avoid copying allocated but unused bytes by
+            // attempting a resize in place, and falling back to allocating
+            // a new buffer and doing our own copy. With a realloc() call,
+            // the allocator implementation would pointlessly copy our
+            // extra capacity.
+            const old_memory = self.allocatedSlice();
+            if (gpa.remap(old_memory, new_cap)) |new_memory| {
+                self.items.ptr = new_memory.ptr;
+                self.cap = new_memory.len;
+            } else {
+                const new_memory = gpa.alloc(T, new_cap) catch @panic("OutOfMemory");
+                @memcpy(new_memory[0..self.items.len], self.items);
+                gpa.free(old_memory);
+                self.items.ptr = new_memory.ptr;
+                self.cap = new_memory.len;
+            }
+        }
+
+        pub fn swapRemove(self: *Self, i: usize) T {
+            std.debug.assert(i < self.items.len);
+            const val = self.items[i];
+            if (i != self.items.len - 1) {
+                self.items[i] = self.items[self.items.len - 1];
+            }
+            self.items.len -= 1;
+            self.items.ptr[self.items.len] = undefined;
+            return val;
+        }
+
+        pub fn orderedRemove(self: *Self, i: usize) T {
+            std.debug.assert(i < self.items.len);
+            const val = self.items[i];
+            if (i != self.items.len - 1) {
+                @memmove(self.items[i .. self.items.len - 1], self.items[i + 1 .. self.items.len]);
+            }
+            self.items.len -= 1;
+            self.items.ptr[self.items.len] = undefined;
+            return val;
+        }
+
+        pub fn pop(self: *Self) ?T {
+            if (self.items.len == 0) return null;
+            const val = self.items[self.items.len - 1];
+            self.items.len -= 1;
+            self.items.ptr[self.items.len] = undefined;
+            return val;
+        }
+
+        const init_capacity: usize = @max(1, std.atomic.cache_line / @sizeOf(T));
+        fn calculateNewCapacity(current: usize, minimum: usize) usize {
+            var new = current;
+            while (true) {
+                new +|= new / 2 + init_capacity;
+                if (new >= minimum)
+                    return new;
+            }
+        }
+    };
+}
+
+pub fn readFileToBytes(filename: []const u8, alloc: std.mem.Allocator) ![]u8 {
+    var file = try std.fs.cwd().openFile(filename, .{});
+    defer file.close();
+    return file.readToEndAlloc(alloc, 1024 * 1024 * 1024);
+}
+
+pub fn resetTempAllocator() void {
+    temp_allocator_backing.reset(.retain_capacity);
+}
+
+pub fn timestamp_seed() u64 {
+    const ts = std.time.nanoTimestamp();
+    const two_vals: [2]u64 = @bitCast(ts);
+    return two_vals[0] ^ two_vals[1];
+}
+
+pub fn Global(comptime T: type) type {
+    return struct {
+        var singleton: ?T = null;
+
+        pub fn set(val: T) void {
+            if (singleton != null) @panic("Singleton for type " ++ @typeName(T) ++ " already set!");
+            singleton = val;
+        }
+        pub fn unset() void {
+            assertSet();
+            singleton = null;
+        }
+
+        pub fn get() T {
+            assertSet();
+            return singleton.?;
+        }
+        fn assertSet() void {
+            if (singleton == null) @panic("Singleton for type " ++ @typeName(T) ++ " not set!");
+        }
+    };
+}
+
+// returns true if the type has a function eq(Self, Self) bool
+pub fn typeHasEqFn(comptime T: type) bool {
+    switch (@typeInfo(T)) {
+        .@"struct", .@"enum", .@"union", .@"opaque" => {
+            if (!@hasDecl(T, "eq")) return false;
+            switch (@typeInfo(@TypeOf(@field(T, "eq")))) {
+                .@"fn" => |function| {
+                    return function.params.len == 2 and function.params[0].type == T and function.params[1].type == T and function.return_type == bool;
+                },
+                else => {
+                    return false;
+                },
+            }
+        },
+        else => return false,
+    }
+}
+
+pub fn typeIsSimple(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .int, .float, .bool => true,
+        .array => |info| typeIsSimple(info.child),
+        .@"struct" => |info| {
+            if (info.layout == .@"extern" or info.layout == .@"packed") return true;
+            inline for (info.fields) |field_info| {
+                if (!typeIsSimple(field_info.type)) return false;
+            }
+            return true;
+        },
+        .@"enum" => true,
+        .@"union" => |info| info.layout == .@"extern",
+        .vector => true,
+        .optional => |info| {
+            return typeIsSimple(info.child);
+        },
+        else => false,
+    };
+}
+
+pub fn typeIsComparable(comptime T: type) bool {
+    if (typeHasEqFn(T)) return true;
+
+    return switch (@typeInfo(T)) {
+        .int, .float, .bool => true,
+        .@"struct" => |info| {
+            if (info.layout == .@"packed") return true;
+            inline for (info.fields) |field_info| {
+                if (!typeIsComparable(field_info.type)) return false;
+            }
+            return true;
+        },
+        .@"union" => |info| {
+            if (info.tag_type == null) return false; // cannot compare untagged union
+            inline for (info.fields) |field_info| {
+                if (!typeIsComparable(field_info.type)) return false;
+            }
+            return true;
+        },
+        .array => |info| {
+            return typeIsComparable(info.child);
+        },
+        .vector => {
+            return true;
+        },
+        .pointer => |info| {
+            return switch (info.size) {
+                .one, .slice => typeIsComparable(info.child),
+                .many, .c => false,
+            };
+        },
+        .optional => |info| {
+            return typeIsComparable(info.child);
+        },
+        else => false,
+    };
+}
+
+pub fn byteEq(a: anytype, b: @TypeOf(a)) bool {
+    const bytes_a = std.mem.asBytes(&a);
+    const bytes_b = std.mem.asBytes(&b);
+    return std.mem.eql(u8, bytes_a, bytes_b);
+}
+
+pub fn eq(a: anytype, b: @TypeOf(a)) bool {
+    const T = @TypeOf(a);
+    // // use custom `eq` function
+    if (comptime typeHasEqFn(T)) return T.eq(a, b);
+    // just compare bytes:
+    if (comptime typeIsSimple(T)) return byteEq(a, b);
+    // do nested compare:
+    switch (@typeInfo(T)) {
+        .@"struct" => |info| {
+            if (info.layout == .@"packed") return a == b;
+            inline for (info.fields) |field_info| {
+                const field_is_equal = eq(@field(a, field_info.name), @field(b, field_info.name));
+                if (!field_is_equal) return false;
+            }
+            return true;
+        },
+        .@"union" => |info| {
+            if (info.tag_type) |UnionTag| {
+                const tag_a: UnionTag = a;
+                const tag_b: UnionTag = b;
+                if (tag_a != tag_b) return false;
+
+                return switch (a) {
+                    inline else => |val, tag| return eq(val, @field(b, @tagName(tag))),
+                };
+            }
+            @compileError("cannot compare untagged union type " ++ @typeName(T));
+        },
+        .array => {
+            if (a.len != b.len) return false;
+            for (a, 0..) |e, i|
+                if (!eq(e, b[i])) return false;
+            return true;
+        },
+        .vector => {
+            @compileError("vectors should always be simple types and this not compared in nested fashion!");
+        },
+        .pointer => |info| {
+            return switch (info.size) {
+                .one => return eq(a.*, b.*),
+                .slice => {
+                    if (a.len != b.len) return false;
+                    var i: usize = 0;
+                    while (i < a.len) : (i += 1) {
+                        if (!eq(a[i], b[i])) return false;
+                    }
+                    return true;
+                },
+                .c, .many => @compileError("Cannot compare c or multi pointer"),
+            };
+        },
+        .optional => {
+            if (a == null and b == null) return true;
+            if (a == null or b == null) return false;
+            return eq(a.?, b.?);
+        },
+        else => @compileError("type cannot be compared:" ++ @typeName(T)),
+    }
+}
+
+const EMPTY_STRING: [:0]const u8 = "";
+pub fn castToCString(str: []const u8) [*:0]const u8 {
+    if (str.len == 0) return EMPTY_STRING;
+    if (str.ptr[str.len] != 0) std.debug.panicExtra(null, "Expected string to be null terminated but it is not: \"{s}\"!", .{str});
+    return @ptrCast(str.ptr);
+}
+
+test "eq_string_slice" {
+    const str1: []const u8 = "Hello World!";
+    var str2 = Array(u8).init();
+    defer str2.deinit();
+    str2.pushSlice("Hello World!");
+
+    try std.testing.expect(eq(str1, str2.items));
+}
+
+// works only for dense enums!
+pub fn EnumArray(comptime E: type, comptime T: type) type {
+    return struct {
+        const len = EnumCount(E);
+        default_value: T,
+        values: [len]T,
+
+        const Self = @This();
+        pub fn init(default_value: T) Self {
+            var self: Self = undefined;
+            self.default_value = default_value;
+            for (&self.values) |*slot| {
+                slot.* = default_value;
+            }
+            return self;
+        }
+        pub fn clear(self: *Self) void {
+            for (self.values) |*slot| {
+                slot.* = self.default_value;
+            }
+        }
+        pub inline fn set(self: *Self, key: E, val: T) void {
+            self.values[@intFromEnum(key)] = val;
+        }
+        pub inline fn get(self: Self, key: E) T {
+            return self.values[@intFromEnum(key)];
+        }
+        pub inline fn getPtr(self: *Self, key: E) *T {
+            return &self.values[@intFromEnum(key)];
+        }
+    };
+}
+
+// enum allowed to be sparse, but all values need to be >= 0
+fn EnumCount(comptime E: type) usize {
+    const enum_info = switch (@typeInfo(E)) {
+        .@"enum" => |enum_info| enum_info,
+        else => @compileError(@typeName(E) ++ " is not enum type!"),
+    };
+    var max_value: usize = 0;
+    for (enum_info.fields) |f| {
+        if (f.value < 0) @compileError("enum values should be all > 0 for " ++ @typeName(E));
+        const value: usize = @intCast(f.value);
+        if (value > max_value) {
+            max_value = value;
+        }
+    }
+    return max_value + 1;
+}
