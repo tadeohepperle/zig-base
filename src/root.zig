@@ -6,6 +6,10 @@ pub const allocator: std.mem.Allocator = allocator_backing.allocator();
 var temp_allocator_backing = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 pub const temp_allocator = temp_allocator_backing.allocator();
 
+pub fn resetTempAllocator() void {
+    temp_allocator_backing.reset(.retain_capacity);
+}
+
 pub fn tmpSlice(comptime T: type, n: usize) []T {
     return temp_allocator.alloc(T, n) catch @panic("TempAllocatorOutOfMemory");
 }
@@ -39,6 +43,7 @@ fn DynamicArray(comptime T: type, comptime is_tmp: bool) type {
         pub fn deinit(self: *Self) void {
             if (comptime is_tmp) return;
             gpa.free(self.allocatedSlice());
+            self.* = Self{};
         }
 
         pub fn deinitWith(self: *Self, deinit_fn: fn (el: *T) void) void {
@@ -69,9 +74,13 @@ fn DynamicArray(comptime T: type, comptime is_tmp: bool) type {
             }
         }
 
+        pub inline fn len(self: Self) usize {
+            return self.items.len;
+        }
+
         pub fn clone(self: Self) Self {
             var res = Self.init();
-            if (self.items.len > 0) res.pushSlice(self.items);
+            if (self.items.len > 0) res.appendSlice(self.items);
             return res;
         }
 
@@ -81,7 +90,7 @@ fn DynamicArray(comptime T: type, comptime is_tmp: bool) type {
             self.items.len = 0;
         }
 
-        pub fn pushSlice(self: *Self, items: []const T) void {
+        pub fn appendSlice(self: *Self, items: []const T) void {
             const new_len = self.items.len + items.len;
             if (new_len > self.cap) {
                 self.reserve(calculateNewCapacity(self.cap, new_len));
@@ -90,7 +99,20 @@ fn DynamicArray(comptime T: type, comptime is_tmp: bool) type {
             self.items.len = new_len;
         }
 
-        pub fn push(self: *Self, item: T) void {
+        pub fn appendNTimes(
+            self: *Self,
+            n: usize,
+            item: T,
+        ) void {
+            const new_len = self.items.len + n;
+            if (new_len > self.cap) {
+                self.reserve(calculateNewCapacity(self.cap, new_len));
+            }
+            @memset(self.items.ptr[self.items.len..new_len], item);
+            self.items.len = new_len;
+        }
+
+        pub fn append(self: *Self, item: T) void {
             const new_len = self.items.len + 1;
             if (new_len > self.cap) {
                 self.reserve(calculateNewCapacity(self.cap, new_len));
@@ -101,7 +123,7 @@ fn DynamicArray(comptime T: type, comptime is_tmp: bool) type {
 
         pub fn makeZeroTerminated(self: *Self) void {
             if (comptime T == u8) {
-                self.push(0);
+                self.append(0);
                 self.items.len -= 1;
             } else {
                 @compileError("Can only make DynamicArray(u8) zero-terminated!");
@@ -172,13 +194,12 @@ fn DynamicArray(comptime T: type, comptime is_tmp: bool) type {
 }
 
 pub fn readFileToBytes(filename: []const u8, alloc: std.mem.Allocator) ![]u8 {
-    var file = try std.fs.cwd().openFile(filename, .{});
+    var file = std.fs.cwd().openFile(filename, .{}) catch |e| {
+        std.log.err("{s}: {s}", .{ @errorName(e), filename });
+        return e;
+    };
     defer file.close();
     return file.readToEndAlloc(alloc, 1024 * 1024 * 1024);
-}
-
-pub fn resetTempAllocator() void {
-    temp_allocator_backing.reset(.retain_capacity);
 }
 
 pub fn timestamp_seed() u64 {
@@ -250,6 +271,7 @@ pub fn typeIsSimple(comptime T: type) bool {
 }
 
 pub fn typeIsComparable(comptime T: type) bool {
+    std.debug.print("{s}", .{@typeName(T)});
     if (typeHasEqFn(T)) return true;
 
     return switch (@typeInfo(T)) {
@@ -364,7 +386,7 @@ test "eq_string_slice" {
     const str1: []const u8 = "Hello World!";
     var str2 = Array(u8).init();
     defer str2.deinit();
-    str2.pushSlice("Hello World!");
+    str2.appendSlice("Hello World!");
 
     try std.testing.expect(eq(str1, str2.items));
 }
@@ -418,3 +440,50 @@ fn EnumCount(comptime E: type) usize {
     }
     return max_value + 1;
 }
+
+pub fn combinePaths(
+    alloc: std.mem.Allocator,
+    parent_file_path: []const u8,
+    child_file_path: []const u8,
+    parent_is_dir: bool,
+) ![]u8 {
+    if (std.fs.path.isAbsolute(child_file_path)) {
+        return try alloc.dupe(u8, child_file_path);
+    }
+    const dir = if (parent_is_dir) parent_file_path else (std.fs.path.dirname(parent_file_path) orelse ".");
+    const resolved = try std.fs.path.resolve(allocator, &.{ dir, child_file_path });
+    // std.debug.print("{s} + {s} = {s}\n", .{ parent_file_path, child_file_path, resolved });
+    return resolved;
+}
+
+test "combine_paths" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(std.mem.eql(u8, try combinePaths(alloc, "shaders/pbr.wgsl", "./utils.wgsl", false), "shaders/utils.wgsl"));
+    try std.testing.expect(std.mem.eql(u8, try combinePaths(alloc, "shaders/pbr.wgsl", "utils.wgsl", false), "shaders/utils.wgsl"));
+    try std.testing.expect(std.mem.eql(u8, try combinePaths(alloc, "./shaders/pbr.wgsl", "./utils.wgsl", false), "shaders/utils.wgsl"));
+    try std.testing.expect(std.mem.eql(u8, try combinePaths(alloc, "./shaders/pbr.wgsl", "../others/utils.wgsl", false), "others/utils.wgsl"));
+    try std.testing.expect(std.mem.eql(u8, try combinePaths(alloc, "./shaders/pbr.wgsl", "../../what.wgsl", false), "../what.wgsl"));
+}
+
+/// Wrapper around std.HashMap treating the key as bytes. Allows for e.g. floats as keys
+pub fn MemHashMap(comptime K: type, V: type) type {
+    const Context = struct {
+        const Self = @This();
+        pub fn hash(_: Self, val: K) u64 {
+            return std.hash.Fnv1a_64.hash(&std.mem.toBytes(val));
+        }
+        pub fn eql(_: Self, a: K, b: K) bool {
+            return std.mem.eql(u8, &std.mem.toBytes(a), &std.mem.toBytes(b));
+        }
+    };
+    return std.HashMap(K, V, Context, 80);
+}
+
+// pub fn Slotmap(comptime T: type) type {
+//     _ = T; // autofix
+
+//     // return struct {
+
+//     // }
+
+// }
