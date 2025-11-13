@@ -7,7 +7,7 @@ var temp_allocator_backing = std.heap.ArenaAllocator.init(std.heap.page_allocato
 pub const temp_allocator = temp_allocator_backing.allocator();
 
 pub fn resetTempAllocator() void {
-    temp_allocator_backing.reset(.retain_capacity);
+    _ = temp_allocator_backing.reset(.retain_capacity);
 }
 
 pub fn tmpSlice(comptime T: type, n: usize) []T {
@@ -479,11 +479,72 @@ pub fn MemHashMap(comptime K: type, V: type) type {
     return std.HashMap(K, V, Context, 80);
 }
 
-// pub fn Slotmap(comptime T: type) type {
-//     _ = T; // autofix
+// Inline storage that
+pub fn InlineAny(comptime SIZE: usize) type {
+    return struct {
+        data: [SIZE]u8 align(16) = undefined,
+        ty_id: TypeId = TypeId.none,
 
-//     // return struct {
+        const Self = @This();
+        pub fn get(self: *const Self, comptime T: type) ?T {
+            // no checkType here, just return null.
+            const ty_id = TypeId.of(T);
+            if (self.ty_id == ty_id) {
+                const data_ptr: *const T = @ptrCast(@alignCast(&self.data));
+                return data_ptr.*;
+            } else {
+                return null;
+            }
+        }
 
-//     // }
+        pub fn set(self: *Self, comptime T: type, value: T) void {
+            comptime {
+                checkType(T);
+            }
+            self.ty_id = TypeId.of(T);
+            const data_ptr: *T = @ptrCast(@alignCast(&self.data));
+            data_ptr.* = value;
+        }
 
-// }
+        pub fn unset(self: *Self) void {
+            self.data = undefined;
+            self.ty_id = TypeId.none;
+        }
+
+        pub fn getOrSet(self: *Self, comptime T: type, default_value: T) *T {
+            comptime {
+                checkType(T);
+            }
+            const data_ptr: *T = @ptrCast(@alignCast(&self.data));
+            const ty_id = TypeId.of(T);
+            if (self.ty_id != ty_id) {
+                self.ty_id = ty_id;
+                data_ptr.* = default_value;
+            }
+            return data_ptr;
+        }
+
+        fn checkType(comptime T: type) void {
+            if (@sizeOf(T) > SIZE) @compileError("Type " ++ @typeName(T) ++ " is too large for " ++ @typeName(Self));
+            if (@alignOf(T) > 16) @compileError("Align of Type" ++ @typeName(T) ++ " too large, can be at most 16");
+        }
+    };
+}
+
+// A unique id for each type.
+pub const TypeId = enum(u64) {
+    none = 0,
+    _,
+
+    const Self = @This();
+
+    pub fn of(comptime T: type) Self {
+        const ptr = &struct {
+            comptime {
+                _ = T;
+            }
+            var id: u8 = undefined;
+        }.id;
+        return @enumFromInt(@as(u64, @intFromPtr(ptr)));
+    }
+};
