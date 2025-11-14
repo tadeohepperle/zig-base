@@ -173,6 +173,63 @@ fn DynamicArray(comptime T: type, comptime is_tmp: bool) type {
             return val;
         }
 
+        pub fn replaceRange(self: *Self, range_start: usize, range_len: usize, new_items: []const T) void {
+            const range_end = range_start + range_len;
+            std.debug.assert(range_end <= self.items.len);
+
+            const range = self.items.ptr[range_start..range_end];
+            if (new_items.len == range_len) {
+                // just replace the items that are already there:
+                @memcpy(range, new_items);
+            } else if (new_items.len < range_len) {
+                // remove more items than new ones are inserted:
+                @memcpy(range[0..new_items.len], new_items);
+                self.removeRange(range_start + new_items.len, range.len - new_items.len);
+            } else {
+                // here new_items.len > range_len, so we might need to resize:
+                const new_len = self.items.len + new_items.len - range_len;
+                if (new_len > self.cap) {
+                    self.reserve(calculateNewCapacity(self.cap, new_len));
+                }
+
+                // now we can first move the items behind the range:
+                const new_range_end = range_start + new_items.len;
+                if (new_range_end >= self.items.len) {
+                    // no overlap, memcpy:
+                    @memcpy(
+                        self.items.ptr[new_range_end..new_len],
+                        self.items.ptr[range_end..self.items.len],
+                    );
+                } else {
+                    // overlap, memmove:
+                    @memmove(
+                        self.items.ptr[new_range_end..new_len],
+                        self.items.ptr[range_end..self.items.len],
+                    );
+                }
+                self.items.len = new_len;
+
+                // finally copy new_items into their place:
+                @memcpy(self.items.ptr[range_start..new_range_end], new_items);
+            }
+        }
+
+        pub fn removeRange(self: *Self, range_start: usize, range_len: usize) void {
+            const range_end = range_start + range_len;
+            std.debug.assert(range_end <= self.items.len);
+
+            const rest_range = self.items[range_end..];
+            if (rest_range.len > 0) {
+                const rest_range_dest = self.items[range_start .. range_start + rest_range.len];
+                if (range_len >= rest_range.len) {
+                    @memcpy(rest_range_dest, rest_range);
+                } else {
+                    @memmove(rest_range_dest, rest_range);
+                }
+            }
+            self.items.len -= range_len;
+        }
+
         pub fn pop(self: *Self) ?T {
             if (self.items.len == 0) return null;
             const val = self.items[self.items.len - 1];
@@ -479,10 +536,10 @@ pub fn MemHashMap(comptime K: type, V: type) type {
     return std.HashMap(K, V, Context, 80);
 }
 
-// Inline storage that
-pub fn InlineAny(comptime SIZE: usize) type {
+// Inline Any storage that stores the typeid for typesafe access.
+pub fn InlineAny(comptime SIZE: usize, comptime MAX_ALIGN: usize) type {
     return struct {
-        data: [SIZE]u8 align(16) = undefined,
+        data: [SIZE]u8 align(MAX_ALIGN) = undefined,
         ty_id: TypeId = TypeId.none,
 
         const Self = @This();
@@ -526,7 +583,7 @@ pub fn InlineAny(comptime SIZE: usize) type {
 
         fn checkType(comptime T: type) void {
             if (@sizeOf(T) > SIZE) @compileError("Type " ++ @typeName(T) ++ " is too large for " ++ @typeName(Self));
-            if (@alignOf(T) > 16) @compileError("Align of Type" ++ @typeName(T) ++ " too large, can be at most 16");
+            if (@alignOf(T) > MAX_ALIGN) @compileError("Align of Type" ++ @typeName(T) ++ " too large, can be at most 16");
         }
     };
 }
