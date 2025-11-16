@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const assert = std.debug.assert;
+
 var allocator_backing = std.heap.GeneralPurposeAllocator(.{}){};
 pub const allocator: std.mem.Allocator = allocator_backing.allocator();
 
@@ -84,6 +86,12 @@ fn DynamicArray(comptime T: type, comptime is_tmp: bool) type {
             return res;
         }
 
+        pub fn fromSlice(slice: []const u8) Self {
+            var self = Self{};
+            self.appendSlice(slice);
+            return self;
+        }
+
         pub fn clear(self: *Self) void {
             if (self.items.len == 0) return;
             @memset(self.items, undefined);
@@ -97,6 +105,17 @@ fn DynamicArray(comptime T: type, comptime is_tmp: bool) type {
             }
             @memcpy(self.items.ptr[self.items.len..new_len], items);
             self.items.len = new_len;
+        }
+
+        /// Appends [N]T to the end of the array and returns a pointer to it.
+        pub fn allocN(self: *Self, comptime N: usize) *[N]T {
+            const new_len = self.items.len + N;
+            if (new_len > self.cap) {
+                self.reserve(calculateNewCapacity(self.cap, new_len));
+            }
+            const res: *[N]T = @ptrCast(&self.items.ptr[self.items.len]);
+            self.items.len += N;
+            return res;
         }
 
         pub fn appendNTimes(
@@ -152,7 +171,7 @@ fn DynamicArray(comptime T: type, comptime is_tmp: bool) type {
         }
 
         pub fn swapRemove(self: *Self, i: usize) T {
-            std.debug.assert(i < self.items.len);
+            assert(i < self.items.len);
             const val = self.items[i];
             if (i != self.items.len - 1) {
                 self.items[i] = self.items[self.items.len - 1];
@@ -163,7 +182,7 @@ fn DynamicArray(comptime T: type, comptime is_tmp: bool) type {
         }
 
         pub fn orderedRemove(self: *Self, i: usize) T {
-            std.debug.assert(i < self.items.len);
+            assert(i < self.items.len);
             const val = self.items[i];
             if (i != self.items.len - 1) {
                 @memmove(self.items[i .. self.items.len - 1], self.items[i + 1 .. self.items.len]);
@@ -175,7 +194,7 @@ fn DynamicArray(comptime T: type, comptime is_tmp: bool) type {
 
         pub fn replaceRange(self: *Self, range_start: usize, range_len: usize, new_items: []const T) void {
             const range_end = range_start + range_len;
-            std.debug.assert(range_end <= self.items.len);
+            assert(range_end <= self.items.len);
 
             const range = self.items.ptr[range_start..range_end];
             if (new_items.len == range_len) {
@@ -215,8 +234,10 @@ fn DynamicArray(comptime T: type, comptime is_tmp: bool) type {
         }
 
         pub fn removeRange(self: *Self, range_start: usize, range_len: usize) void {
+            if (range_len == 0) return;
+
             const range_end = range_start + range_len;
-            std.debug.assert(range_end <= self.items.len);
+            assert(range_end <= self.items.len);
 
             const rest_range = self.items[range_end..];
             if (rest_range.len > 0) {
@@ -328,7 +349,6 @@ pub fn typeIsSimple(comptime T: type) bool {
 }
 
 pub fn typeIsComparable(comptime T: type) bool {
-    std.debug.print("{s}", .{@typeName(T)});
     if (typeHasEqFn(T)) return true;
 
     return switch (@typeInfo(T)) {
@@ -509,7 +529,6 @@ pub fn combinePaths(
     }
     const dir = if (parent_is_dir) parent_file_path else (std.fs.path.dirname(parent_file_path) orelse ".");
     const resolved = try std.fs.path.resolve(allocator, &.{ dir, child_file_path });
-    // std.debug.print("{s} + {s} = {s}\n", .{ parent_file_path, child_file_path, resolved });
     return resolved;
 }
 
@@ -605,3 +624,339 @@ pub const TypeId = enum(u64) {
         return @enumFromInt(@as(u64, @intFromPtr(ptr)));
     }
 };
+
+pub const UtfChar = struct {
+    buf: [4]u8,
+    len: u3,
+    const Self = @This();
+    pub fn of(codepoint: u21) Self {
+        var self: Self = undefined;
+        self.len = std.unicode.utf8Encode(codepoint, &self.buf) catch @panic("invalid codepoint");
+        return self;
+    }
+    pub fn get(self: *const Self) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// Given a type, references all the declarations inside, so that the semantic analyzer sees them.
+pub fn refAllDecls(comptime T: type) void {
+    inline for (comptime std.meta.declarations(T)) |decl| {
+        _ = &@field(T, decl.name);
+    }
+}
+
+/// Given a type, recursively references all the declarations inside, so that the semantic analyzer sees them.
+/// For deep types, you may use `@setEvalBranchQuota`.
+pub fn refAllDeclsRecursive(comptime T: type) void {
+    inline for (comptime std.meta.declarations(T)) |decl| {
+        if (@TypeOf(@field(T, decl.name)) == type) {
+            switch (@typeInfo(@field(T, decl.name))) {
+                .@"struct", .@"enum", .@"union", .@"opaque" => refAllDeclsRecursive(@field(T, decl.name)),
+                else => {},
+            }
+        }
+        _ = &@field(T, decl.name);
+    }
+}
+
+pub fn BucketArray(comptime T: type) type {
+    return struct {
+        const N_PER_BUCKET = 32;
+        const BUCKET_ALIGN = @sizeOf(T) * N_PER_BUCKET;
+        const UInt = std.meta.Int(.unsigned, N_PER_BUCKET);
+        const BucketSlotMap = SlotMap(*Bucket);
+
+        non_full_buckets: Array(*Bucket) = .{},
+        full_buckets: BucketSlotMap = .{},
+        next_bucket_id: u32 = 0,
+
+        const Self = @This();
+
+        const Bucket = extern struct {
+            items: [32]T align(BUCKET_ALIGN),
+            occupation: UInt,
+            id: u32, // stable over entire lifecycle of bucket
+            key_in_parent: BucketSlotMap.Key, // only relevant for full buckets!
+            parent: *Self,
+
+            const EMPTY: UInt = 0;
+            const FULL: UInt = ~EMPTY;
+
+            const SelfBucket = @This();
+
+            fn new(parent: *Self, id: u32) *SelfBucket {
+                const bucket = allocator.create(SelfBucket) catch unreachable;
+                bucket.occupation = EMPTY;
+                bucket.parent = parent;
+                bucket.id = id;
+                const bucket_addr: usize = @intFromPtr(bucket);
+                assert(bucket_addr % BUCKET_ALIGN == 0);
+                return bucket;
+            }
+
+            fn alloc(self: *SelfBucket) *T {
+                assert(self.occupation != FULL);
+                const idx = firstFreeSlotIdx(self.occupation);
+                self.setBit(idx);
+                return &self.items[idx];
+            }
+
+            fn dealloc(self: *SelfBucket, slot_idx: usize) void {
+                assert(isBitSet(self, slot_idx));
+                self.unsetBit(slot_idx);
+            }
+
+            fn setBit(self: *SelfBucket, idx: usize) void {
+                assert(idx < N_PER_BUCKET);
+                self.occupation |= @as(UInt, 1) << @intCast(idx);
+            }
+
+            fn isBitSet(self: *const SelfBucket, idx: usize) bool {
+                assert(idx < N_PER_BUCKET);
+                const slot_bit: UInt = @as(UInt, 1) << @intCast(idx);
+                return (self.occupation & slot_bit) != 0;
+            }
+
+            fn unsetBit(self: *SelfBucket, idx: usize) void {
+                assert(idx < N_PER_BUCKET);
+                const slot_bit: UInt = @as(UInt, 1) << @intCast(idx);
+                self.occupation &= ~slot_bit;
+            }
+
+            fn firstFreeSlotIdx(occupation: UInt) usize {
+                return @ctz(~occupation);
+            }
+        };
+
+        pub fn init() Self {
+            return Self{};
+        }
+        pub fn deinit(self: *Self) void {
+            for (self.non_full_buckets.items) |bucket| {
+                allocator.destroy(bucket);
+            }
+            var it = self.full_buckets.iterator();
+            while (it.next()) |b| {
+                const bucket: *Bucket = b.*;
+                allocator.destroy(bucket);
+            }
+        }
+
+        pub fn append(self: *Self, val: T) *T {
+            var bucket: *Bucket = undefined;
+            if (self.non_full_buckets.len() > 0) {
+                bucket = self.non_full_buckets.items[self.non_full_buckets.len() - 1];
+            } else {
+                self.next_bucket_id += 1;
+                bucket = Bucket.new(self, self.next_bucket_id);
+                self.non_full_buckets.append(bucket);
+            }
+            const ptr = bucket.alloc();
+            ptr.* = val;
+
+            // add to list of full buckets:
+            if (bucket.occupation == Bucket.FULL) {
+                assert(self.non_full_buckets.pop().? == bucket);
+                bucket.key_in_parent = self.full_buckets.insert(bucket);
+            }
+            return ptr;
+        }
+
+        // The cool thing is: due to the alignment we can find the
+        pub fn free(ptr: *T) void {
+            const loc = locate(ptr);
+            // std.debug.print("{} is at idx: {}, key: {}\n", .{ ptr.*, loc.idx, loc.bucket.key_in_parent });
+            const idx = loc.idx;
+            const bucket = loc.bucket;
+
+            const was_full_before = bucket.occupation == Bucket.FULL;
+            bucket.dealloc(idx);
+            if (was_full_before) {
+                const bucket_array = bucket.parent;
+                _ = bucket_array.full_buckets.remove(bucket.key_in_parent);
+                bucket_array.non_full_buckets.append(bucket);
+            }
+        }
+
+        pub fn locate(ptr: *T) struct { idx: usize, bucket: *Bucket } {
+            const ptr_addr: usize = @intFromPtr(ptr);
+            const offset_from_bucket_start = ptr_addr % BUCKET_ALIGN;
+            assert(offset_from_bucket_start % @sizeOf(T) == 0);
+            const idx = offset_from_bucket_start / @sizeOf(T);
+            const bucket_addr = std.mem.alignBackward(usize, ptr_addr, BUCKET_ALIGN);
+            const bucket: *Bucket = @ptrFromInt(bucket_addr);
+            return .{ .idx = idx, .bucket = bucket };
+        }
+
+        const Iterator = struct {
+            bucket_array: *Self,
+            still_iterating_full_buckets: bool,
+            bucket_idx: u32,
+            idx_in_bucket: u32,
+
+            pub fn next(self: *@This()) ?*T {
+                // iterate items in full_buckets:
+                if (self.still_iterating_full_buckets) {
+                    const full_bucket_slots = self.bucket_array.full_buckets.slots.items;
+                    while (self.bucket_idx < full_bucket_slots.len) : (self.bucket_idx += 1) {
+                        const slot: *BucketSlotMap.Slot = &full_bucket_slots[self.bucket_idx];
+                        switch (slot.*) {
+                            .value => |bucket| {
+                                // iterate the bucket:
+                                while (self.idx_in_bucket < N_PER_BUCKET) {
+                                    defer self.idx_in_bucket += 1;
+                                    if (bucket.isBitSet(self.idx_in_bucket)) {
+                                        const item_ptr = &bucket.items[self.idx_in_bucket];
+                                        return item_ptr;
+                                    }
+                                }
+                            },
+                            .next_free_idx => continue,
+                        }
+                        self.idx_in_bucket = 0;
+                    }
+                    // go on to iterate non_full_buckets:
+                    self.still_iterating_full_buckets = false;
+                    self.bucket_idx = 0;
+                }
+
+                // iterate items in non_full_buckets:
+                const non_full_buckets = self.bucket_array.non_full_buckets.items;
+                while (self.bucket_idx < non_full_buckets.len) : (self.bucket_idx += 1) {
+                    const bucket: *Bucket = non_full_buckets[self.bucket_idx];
+                    // iterate the bucket:
+                    while (self.idx_in_bucket < N_PER_BUCKET) {
+                        defer self.idx_in_bucket += 1;
+                        if (bucket.isBitSet(self.idx_in_bucket)) {
+                            const item_ptr = &bucket.items[self.idx_in_bucket];
+                            return item_ptr;
+                        }
+                    }
+                    self.idx_in_bucket = 0;
+                }
+                return null;
+            }
+        };
+        pub fn iterator(self: *Self) Iterator {
+            return Iterator{
+                .bucket_array = self,
+                .still_iterating_full_buckets = true,
+                .idx_in_bucket = 0,
+                .bucket_idx = 0,
+            };
+        }
+    };
+}
+
+// can store up to u32::MAX elements.
+pub fn SlotMap(comptime T: type) type {
+    return struct {
+        pub const Key = enum(u32) { _ };
+        const Slot = union(enum) {
+            value: T,
+            next_free_idx: ?u32,
+        };
+
+        slots: Array(Slot) = .{},
+        next_free_slot: ?u32 = null,
+        _len: u32 = 0,
+
+        const Self = @This();
+        pub fn init() Self {
+            return Self{};
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.slots.deinit();
+        }
+
+        pub fn len(self: Self) u32 {
+            return self._len;
+        }
+
+        pub fn pushFreeIdx(self: *Self, idx: u32) void {
+            self.slots.items[idx] = Slot{ .next_free_idx = self.next_free_slot };
+            self.next_free_slot = idx;
+        }
+
+        pub fn popFreeIdx(self: *Self) ?u32 {
+            const next_free_idx = self.next_free_slot orelse return null;
+            switch (self.slots.items[next_free_idx]) {
+                .next_free_idx => |i| {
+                    self.next_free_slot = i;
+                },
+                .value => @panic("expected free idx in slot!"),
+            }
+            return next_free_idx;
+        }
+
+        pub fn insert(self: *Self, value: T) Key {
+            if (self.popFreeIdx()) |slot_idx| {
+                const slot_ptr: *Slot = &self.slots.items[slot_idx];
+                slot_ptr.* = Slot{ .value = value };
+
+                self._len += 1;
+                return @enumFromInt(slot_idx);
+            } else {
+                if (self.slots.len() == std.math.maxInt(u32)) @panic("Cannot add more than u32::MAX items to slotmap");
+
+                const slot_idx: u32 = @intCast(self.slots.len());
+                self.slots.append(Slot{ .value = value });
+
+                self._len += 1;
+                return @enumFromInt(slot_idx);
+            }
+        }
+
+        pub fn get(self: Self, key: Key) T {
+            const idx: u32 = @intFromEnum(key);
+            const slot = &self.slots.items[idx];
+            switch (slot.*) {
+                .next_free_idx => @panic("found empty slot where value was expected"),
+                .value => |v| {
+                    return v;
+                },
+            }
+        }
+
+        pub fn remove(self: *Self, key: Key) T {
+            const idx: u32 = @intFromEnum(key);
+            const slot: *Slot = &self.slots.items[idx];
+            const value = switch (slot.*) {
+                .next_free_idx => @panic("found empty slot where value was expected"),
+                .value => |v| v,
+            };
+
+            slot.* = Slot{ .next_free_idx = null };
+            self.pushFreeIdx(idx);
+
+            assert(self._len > 0);
+            self._len -= 1;
+            return value;
+        }
+
+        const Iterator = struct {
+            slotmap: *Self,
+            idx: u32,
+
+            pub fn next(self: *@This()) ?*T {
+                while (self.idx < self.slotmap.slots.len()) {
+                    defer self.idx += 1;
+                    const slot: *Slot = &self.slotmap.slots.items[self.idx];
+                    switch (slot.*) {
+                        .value => |*v| return v,
+                        .next_free_idx => continue,
+                    }
+                }
+                return null;
+            }
+        };
+        pub fn iterator(self: *Self) Iterator {
+            return Iterator{
+                .slotmap = self,
+                .idx = 0,
+            };
+        }
+    };
+}
