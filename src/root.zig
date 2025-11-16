@@ -660,6 +660,16 @@ pub fn refAllDeclsRecursive(comptime T: type) void {
     }
 }
 
+// A BucketArray(T) is like a Array(*T) in that pointers to the elements stay stable, which you cannot do with an
+// Array(T), because appending might resize and thus invalidate pointers.
+// But unlike an Array(*T), there is not a a single allocation for each item. Instead, chunks of 32 items are allocated
+// together in a contigous region and occupation of these slots of a "Bucket" is managed by the array.
+// So it is basically a custom allocator for T values, where you can also iterate over the contents.
+//
+// I think I saw some sort of BucketArray structure in the sourcecode of the Jai closed beta,
+// which inspired me to roll my own here. Handle arrays can be quite nice and require less than 8 bytes for the handles,
+// but I think having stable pointers is also cool in some cases where you want to just chase the pointer directly and
+// not litter your code with lookup functions.
 pub fn BucketArray(comptime T: type) type {
     return struct {
         const N_PER_BUCKET = 32;
@@ -748,8 +758,8 @@ pub fn BucketArray(comptime T: type) type {
             if (self.non_full_buckets.len() > 0) {
                 bucket = self.non_full_buckets.items[self.non_full_buckets.len() - 1];
             } else {
-                self.next_bucket_id += 1;
                 bucket = Bucket.new(self, self.next_bucket_id);
+                self.next_bucket_id += 1;
                 self.non_full_buckets.append(bucket);
             }
             const ptr = bucket.alloc();
@@ -763,7 +773,9 @@ pub fn BucketArray(comptime T: type) type {
             return ptr;
         }
 
-        // The cool thing is: due to the alignment we can find the
+        // The cool thing about the stable pointers given out by the bucket array is:
+        // We can use them to find back to the bucket they belong to and remove them there without any additional information.
+        // This is due to the alignment of the buckets: we just need to align each
         pub fn free(ptr: *T) void {
             const loc = locate(ptr);
             // std.debug.print("{} is at idx: {}, key: {}\n", .{ ptr.*, loc.idx, loc.bucket.key_in_parent });
