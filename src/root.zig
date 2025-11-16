@@ -791,40 +791,13 @@ pub fn BucketArray(comptime T: type) type {
 
         const Iterator = struct {
             bucket_array: *Self,
-            still_iterating_full_buckets: bool,
+            done_with_full_buckets: bool,
             bucket_idx: u32,
+            bucket: ?*Bucket,
             idx_in_bucket: u32,
 
             pub fn next(self: *@This()) ?*T {
-                // iterate items in full_buckets:
-                if (self.still_iterating_full_buckets) {
-                    const full_bucket_slots = self.bucket_array.full_buckets.slots.items;
-                    while (self.bucket_idx < full_bucket_slots.len) : (self.bucket_idx += 1) {
-                        const slot: *BucketSlotMap.Slot = &full_bucket_slots[self.bucket_idx];
-                        switch (slot.*) {
-                            .value => |bucket| {
-                                // iterate the bucket:
-                                while (self.idx_in_bucket < N_PER_BUCKET) {
-                                    defer self.idx_in_bucket += 1;
-                                    if (bucket.isBitSet(self.idx_in_bucket)) {
-                                        const item_ptr = &bucket.items[self.idx_in_bucket];
-                                        return item_ptr;
-                                    }
-                                }
-                            },
-                            .next_free_idx => continue,
-                        }
-                        self.idx_in_bucket = 0;
-                    }
-                    // go on to iterate non_full_buckets:
-                    self.still_iterating_full_buckets = false;
-                    self.bucket_idx = 0;
-                }
-
-                // iterate items in non_full_buckets:
-                const non_full_buckets = self.bucket_array.non_full_buckets.items;
-                while (self.bucket_idx < non_full_buckets.len) : (self.bucket_idx += 1) {
-                    const bucket: *Bucket = non_full_buckets[self.bucket_idx];
+                if (self.bucket) |bucket| {
                     // iterate the bucket:
                     while (self.idx_in_bucket < N_PER_BUCKET) {
                         defer self.idx_in_bucket += 1;
@@ -833,17 +806,52 @@ pub fn BucketArray(comptime T: type) type {
                             return item_ptr;
                         }
                     }
+                    self.bucket = null;
                     self.idx_in_bucket = 0;
                 }
+                // select the next bucket:
+                self.bucket = self.selectNextBucket() orelse return null;
+                return self.next();
+            }
+
+            fn selectNextBucket(self: *@This()) ?*Bucket {
+                if (!self.done_with_full_buckets) {
+                    const full_bucket_slots = self.bucket_array.full_buckets.slots.items;
+                    while (self.bucket_idx < full_bucket_slots.len) {
+                        defer self.bucket_idx += 1;
+                        const slot: *BucketSlotMap.Slot = &full_bucket_slots[self.bucket_idx];
+                        switch (slot.*) {
+                            .value => |bucket| {
+                                return bucket;
+                            },
+                            .next_free_idx => continue,
+                        }
+                        self.idx_in_bucket = 0;
+                    }
+                    // go on to iterate non_full_buckets:
+                    self.done_with_full_buckets = true;
+                    self.bucket_idx = 0;
+                }
+
+                // iterate items in non_full_buckets:
+                const non_full_buckets = self.bucket_array.non_full_buckets.items;
+                while (self.bucket_idx < non_full_buckets.len) {
+                    defer self.bucket_idx += 1;
+                    const bucket: *Bucket = non_full_buckets[self.bucket_idx];
+                    return bucket;
+                }
+
                 return null;
             }
         };
+
         pub fn iterator(self: *Self) Iterator {
             return Iterator{
                 .bucket_array = self,
-                .still_iterating_full_buckets = true,
+                .done_with_full_buckets = false,
                 .idx_in_bucket = 0,
                 .bucket_idx = 0,
+                .bucket = null,
             };
         }
     };

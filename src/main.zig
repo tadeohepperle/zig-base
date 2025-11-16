@@ -67,7 +67,7 @@ fn mainBucketArrayExample() void {
         std.debug.print("{*} = {}\n", .{ v, v.* });
     }
 
-    var rng = std.Random.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
+    var rng = std.Random.DefaultPrng.init(3293292);
 
     var n_freed: usize = 0;
     for (element_pointers.items) |ptr| {
@@ -78,9 +78,9 @@ fn mainBucketArrayExample() void {
         }
     }
 
-    for (0..n_freed) |i| {
-        _ = bucket_arr.append(100000 + @as(u32, @intCast(i)));
-    }
+    // for (0..n_freed) |i| {
+    //     _ = bucket_arr.append(100000 + @as(u32, @intCast(i)));
+    // }
 
     std.debug.print("Removed some numbers and filled back with 1000xx:\n", .{});
     iter = bucket_arr.iterator();
